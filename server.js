@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy with Persistent Retry Polling
+// server.js - OpenAI to NVIDIA NIM API Proxy with GLM & Reasoning Support
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -18,7 +18,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const SHOW_REASONING = true;
 const ENABLE_THINKING_MODE = true;
 
-// 🚀 EXTENDED FAULT TOLERANCE TUNING (Hold connection & retry up to ~45 seconds)
+// FAULT TOLERANCE TUNING (Hold connection & retry up to ~45 seconds)
 const MAX_RETRIES = 12;            
 const INITIAL_RETRY_DELAY = 2000; 
 
@@ -66,7 +66,7 @@ app.get('/health', (req, res) => {
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: Object.keys(MODEL_MAPPING).map(m => ({ id: m, object: 'model', created: Date.now(), owned_by: 'nvidia-nim-proxy' }))
+    data: Object.keys(MODEL_MAPPING).map(m => ({ id: m, object: 'model', created: Date.now(), owned_by: 'nvidia-nvidia-proxy' }))
   });
 });
 
@@ -96,9 +96,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
+    // 🚀 UNIFIED THINKING KWARGS FOR GLM, DEEPSEEK, AND QWEN
     if (ENABLE_THINKING_MODE) {
       if (nimModel.includes('glm')) {
-        nimRequest.chat_template_kwargs = { enable_thinking: true, clear_thinking: false };
+        nimRequest.chat_template_kwargs = { thinking: true, enable_thinking: true, clear_thinking: false };
       } else if (nimModel.includes('deepseek') || nimModel.includes('qwen')) {
         nimRequest.chat_template_kwargs = { thinking: true }; 
       }
@@ -110,7 +111,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       if (res.flushHeaders) res.flushHeaders();
 
-      // Keepalive heartbeat sent every 15s so JanitorAI/Railway don't disconnect while proxy retries
       const heartbeat = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -182,37 +182,33 @@ app.post('/v1/chat/completions', async (req, res) => {
                 
                 if (data.choices?.[0]?.delta) {
                   const delta = data.choices[0].delta;
-                  const reasoning = delta.reasoning_content;
+                  // 🚀 GLM & Reasoning Parser Support
+                  const reasoning = delta.reasoning_content || delta.reasoning;
                   const content = delta.content;
-                  const isGLM = nimModel.includes('glm');
 
-                  if (isGLM) {
-                    delta.content = (content !== undefined && content !== null) ? content : "";
-                    delete delta.reasoning_content;
-                  } else {
-                    if (SHOW_REASONING) {
-                      let combinedContent = '';
-                      
-                      if (reasoning) {
-                        if (!reasoningStarted) {
-                          combinedContent += '<think>\n';
-                          reasoningStarted = true;
-                        }
-                        combinedContent += reasoning;
+                  if (SHOW_REASONING) {
+                    let combinedContent = '';
+                    
+                    if (reasoning) {
+                      if (!reasoningStarted) {
+                        combinedContent += '<think>\n';
+                        reasoningStarted = true;
                       }
-                      
-                      if (content !== undefined && content !== null) {
-                        if (reasoningStarted && content !== '') {
-                          combinedContent += '\n</think>\n\n';
-                          reasoningStarted = false;
-                        }
-                        combinedContent += content;
+                      combinedContent += reasoning;
+                    }
+                    
+                    if (content !== undefined && content !== null) {
+                      if (reasoningStarted && content !== '') {
+                        combinedContent += '\n</think>\n\n';
+                        reasoningStarted = false;
                       }
-                      
-                      if (combinedContent !== '' || typeof content === 'string') {
-                        delta.content = combinedContent || content || "";
-                        delete delta.reasoning_content;
-                      }
+                      combinedContent += content;
+                    }
+                    
+                    if (combinedContent !== '' || typeof content === 'string') {
+                      delta.content = combinedContent || content || "";
+                      delete delta.reasoning_content;
+                      delete delta.reasoning;
                     }
                   }
                 }
