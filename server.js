@@ -28,12 +28,10 @@ const axiosInstance = axios.create({
 });
 
 const MODEL_MAPPING = {
-  'deepseek-flash': 'deepseek-ai/deepseek-v4-flash',
-  'deepseek-pro': 'deepseek-ai/deepseek-v4-pro',
+  'nvidia120': 'nvidia/nemotron-3-super-120b-a12b',
+  'nvidia550': 'nvidia/nemotron-3-ultra-550b-a55b',
   'glm5': 'z-ai/glm-5.2',
-  'qwen3.5-120': 'qwen/qwen3.5-122b-a10b',
-  'qwen3.5-300': 'qwen/qwen3.5-397b-a17b',
-  'moonshot': 'moonshotai/kimi-k2.6' 
+  'gpt': 'openai/gpt-oss-120b' 
 };
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
