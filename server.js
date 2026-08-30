@@ -103,9 +103,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Route priority: DeepInfra first, allow fallbacks, optimize for throughput
       provider: {
-        order: ['DeepInfra'],
-        allow_fallbacks: true,
-        sort: 'throughput'
+        sort: 'price'
       }
     };
 
