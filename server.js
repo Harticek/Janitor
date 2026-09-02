@@ -1,4 +1,4 @@
-// server.js - OpenAI to OpenRouter API Proxy for JanitorAI
+// server.js - Resilient OpenAI-compatible OpenRouter Proxy for JanitorAI
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -8,36 +8,30 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 1. MIDDLEWARE
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// 2. CONFIGURATION & ENVIRONMENT VARIABLES
 const OPENROUTER_API_BASE = process.env.OPENROUTER_API_BASE || 'https://openrouter.ai/api/v1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.NIM_API_KEY;
 
 const SHOW_REASONING = true;
 const ENABLE_THINKING_MODE = true;
 
-// Connection pooling
 const axiosInstance = axios.create({
   httpAgent: new http.Agent({ keepAlive: true }),
   httpsAgent: new https.Agent({ keepAlive: true }),
 });
 
-// Model mapping to OpenRouter slugs
 const MODEL_MAPPING = {
-  'deepseek-flash': 'deepseek/deepseek-v4-flash-0731',
-  'deepseek-chat': 'deepseek/deepseek-chat',
-  'deepseek-r1': 'deepseek/deepseek-r1',
-  'glm5': 'z-ai/glm-5.2',
-  'qwen3.5-120': 'qwen/qwen-2.5-72b-instruct'
+  'deepseek-flash': 'deepseek/deepseek-v4-flash-0731:floor',
+  'deepseek-chat': 'deepseek/deepseek-chat:floor',
+  'deepseek-r1': 'deepseek/deepseek-r1:floor',
+  'qwen-72b': 'qwen/qwen-2.5-72b-instruct:floor'
 };
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Helper to parse detailed error streams from Axios
 async function parseAxiosStreamError(error) {
   if (error.response?.data && typeof error.response.data.on === 'function') {
     try {
@@ -75,12 +69,11 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// MAIN COMPLETIONS ENDPOINT
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     let { model, messages, temperature, max_tokens, stream } = req.body;
 
-    // Scrub old <think> tags from chat history to save context tokens
+    // Strip previous thought tags to prevent context bloating
     let cleanedMessages = (messages || []).map(msg => {
       let content = msg.content;
       if (msg.role === 'assistant' && typeof content === 'string') {
@@ -92,23 +85,28 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
     });
 
-    const targetModel = MODEL_MAPPING[model] || model || 'deepseek/deepseek-v4-flash-0731';
+    const targetModel = MODEL_MAPPING[model] || model || 'deepseek/deepseek-v4-flash-0731:floor';
+
+    // Ensure adequate token headroom so reasoning doesn't consume entire budget
+    const safeMaxTokens = Math.max(max_tokens || 2048, 2048);
 
     const openrouterRequest = {
       model: targetModel,
       messages: cleanedMessages,
-      temperature: temperature || 0.7,
-      max_tokens: max_tokens || 4096,
+      temperature: temperature !== undefined ? temperature : 0.7,
+      max_tokens: safeMaxTokens,
       stream: stream || false,
-
-      // Route priority: DeepInfra first, allow fallbacks, optimize for throughput
       provider: {
-        sort: 'price'
+        sort: 'price',
+        allow_fallbacks: true
       }
     };
 
+    // Use only 'effort' to prevent OpenRouter 400 parameter conflict
     if (ENABLE_THINKING_MODE) {
-      openrouterRequest.reasoning = { effort: 'medium' };
+      openrouterRequest.reasoning = {
+        effort: 'low'
+      };
     }
 
     if (stream) {
@@ -117,7 +115,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       if (res.flushHeaders) res.flushHeaders();
 
-      // Keepalive heartbeat sent every 15s to bypass Railway timeouts
+      // Prevent idle connection dropouts
       const heartbeat = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -138,7 +136,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                 'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
                 'Content-Type': 'application/json',
                 'HTTP-Referer': 'https://railway.app',
-                'X-Title': 'JanitorAI Roleplay Proxy'
+                'X-Title': 'JanitorAI Proxy'
               },
               responseType: 'stream',
               timeout: 300000
@@ -150,7 +148,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             console.error(`🚨 OpenRouter Error [Status ${status}]:`, detailedErrorMsg);
 
-            // Fast-fail permanent client errors
+            // Halt immediately on hard client errors
             if (status === 400 || status === 401 || status === 404) {
               throw new Error(`[HTTP ${status}] ${detailedErrorMsg}`);
             }
@@ -169,75 +167,101 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         let buffer = '';
         let reasoningStarted = false;
+        let hasEmittedContent = false;
 
         response.data.on('data', (chunk) => {
           buffer += chunk.toString();
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
-          lines.forEach(line => {
-            if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith(':')) continue;
+
+            if (trimmed.startsWith('data: ')) {
+              const payload = trimmed.slice(6);
+
+              if (payload === '[DONE]') {
+                if (reasoningStarted) {
+                  res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '\n</think>\n\n' } }] })}\n\n`);
+                  reasoningStarted = false;
+                }
+                res.write('data: [DONE]\n\n');
+                continue;
+              }
+
               try {
-                const data = JSON.parse(line.slice(6));
+                const data = JSON.parse(payload);
 
                 if (data.choices?.[0]?.delta) {
                   const delta = data.choices[0].delta;
                   const reasoning = delta.reasoning_content || delta.reasoning;
                   const content = delta.content;
 
-                  if (SHOW_REASONING) {
-                    let combinedContent = '';
+                  let combinedContent = '';
 
-                    if (reasoning) {
-                      if (!reasoningStarted) {
-                        combinedContent += '<think>\n';
-                        reasoningStarted = true;
-                      }
-                      combinedContent += reasoning;
+                  if (SHOW_REASONING && reasoning) {
+                    if (!reasoningStarted) {
+                      combinedContent += '<think>\n';
+                      reasoningStarted = true;
                     }
-
-                    if (content !== undefined && content !== null) {
-                      if (reasoningStarted && content !== '') {
-                        combinedContent += '\n</think>\n\n';
-                        reasoningStarted = false;
-                      }
-                      combinedContent += content;
-                    }
-
-                    if (combinedContent !== '' || typeof content === 'string') {
-                      delta.content = combinedContent || content || '';
-                      delete delta.reasoning_content;
-                      delete delta.reasoning;
-                    }
+                    combinedContent += reasoning;
                   }
+
+                  if (content !== undefined && content !== null) {
+                    if (reasoningStarted && content !== '') {
+                      combinedContent += '\n</think>\n\n';
+                      reasoningStarted = false;
+                    }
+                    combinedContent += content;
+                  }
+
+                  if (combinedContent !== '') {
+                    hasEmittedContent = true;
+                    delta.content = combinedContent;
+                    delete delta.reasoning_content;
+                    delete delta.reasoning;
+                    res.write(`data: ${JSON.stringify(data)}\n\n`);
+                  }
+                } else {
+                  res.write(`data: ${JSON.stringify(data)}\n\n`);
                 }
-                res.write(`data: ${JSON.stringify(data)}\n\n`);
               } catch (e) {
                 // Ignore incomplete line chunks
               }
-            } else if (line.includes('[DONE]')) {
-              res.write(line + '\n');
             }
-          });
+          }
         });
 
-        response.data.on('end', () => res.end());
+        response.data.on('end', () => {
+          if (reasoningStarted) {
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '\n</think>\n\n' } }] })}\n\n`);
+          }
+          if (!hasEmittedContent) {
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '\n\n*(Model reached token budget before drafting narrative. Increase Max New Tokens in settings.)*' } }] })}\n\n`);
+          }
+          res.end();
+        });
 
       } catch (streamError) {
         clearInterval(heartbeat);
-        console.error('🚨 Stream Execution Failed:', streamError.message);
-        res.write(`data: ${JSON.stringify({ error: { message: `Proxy Error: ${streamError.message}` } })}\n\n`);
+        console.error('🚨 Stream Error:', streamError.message);
+        
+        // Write the actual error into the chat UI rather than triggering pgshag2
+        res.write(`data: ${JSON.stringify({
+          choices: [{ delta: { content: `\n\n**[Proxy Error]**: ${streamError.message}` } }]
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
         res.end();
       }
 
     } else {
-      // Non-streaming fallback
       const response = await axiosInstance.post(`${OPENROUTER_API_BASE}/chat/completions`, openrouterRequest, {
         headers: {
           'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
           'Content-Type': 'application/json',
           'HTTP-Referer': 'https://railway.app',
-          'X-Title': 'JanitorAI Roleplay Proxy'
+          'X-Title': 'JanitorAI Proxy'
         },
         responseType: 'json',
         timeout: 300000
@@ -255,4 +279,4 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.all('*', (req, res) => res.status(404).json({ error: { message: 'Not found' } }));
-app.listen(PORT, () => console.log(`🚀 OpenRouter Proxy active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Proxy active on port ${PORT}`));
