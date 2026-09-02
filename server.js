@@ -1,4 +1,4 @@
-// server.js - Resilient OpenAI-compatible OpenRouter Proxy for JanitorAI
+// server.js - OpenAI to OpenRouter Proxy (Reasoning Disabled)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -14,9 +14,6 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const OPENROUTER_API_BASE = process.env.OPENROUTER_API_BASE || 'https://openrouter.ai/api/v1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.NIM_API_KEY;
-
-const SHOW_REASONING = true;
-const ENABLE_THINKING_MODE = true;
 
 const axiosInstance = axios.create({
   httpAgent: new http.Agent({ keepAlive: true }),
@@ -54,7 +51,7 @@ async function parseAxiosStreamError(error) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'OpenRouter Proxy Active' });
+  res.json({ status: 'ok', service: 'OpenRouter Proxy Active (No Reasoning)' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -73,7 +70,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     let { model, messages, temperature, max_tokens, stream } = req.body;
 
-    // Strip previous thought tags to prevent context bloating
+    // Clean any legacy <think> blocks out of older chat history to save tokens
     let cleanedMessages = (messages || []).map(msg => {
       let content = msg.content;
       if (msg.role === 'assistant' && typeof content === 'string') {
@@ -87,27 +84,22 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const targetModel = MODEL_MAPPING[model] || model || 'deepseek/deepseek-v4-flash-0731:floor';
 
-    // Ensure adequate token headroom so reasoning doesn't consume entire budget
-    const safeMaxTokens = Math.max(max_tokens || 2048, 2048);
-
     const openrouterRequest = {
       model: targetModel,
       messages: cleanedMessages,
       temperature: temperature !== undefined ? temperature : 0.7,
-      max_tokens: safeMaxTokens,
+      max_tokens: max_tokens || 2048,
       stream: stream || false,
       provider: {
         sort: 'price',
         allow_fallbacks: true
+      },
+      // 🚀 Explicitly disable thinking and drop reasoning tokens
+      reasoning: {
+        effort: 'none',
+        exclude: true
       }
     };
-
-    // Use only 'effort' to prevent OpenRouter 400 parameter conflict
-    if (ENABLE_THINKING_MODE) {
-      openrouterRequest.reasoning = {
-        effort: 'low'
-      };
-    }
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -115,7 +107,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       if (res.flushHeaders) res.flushHeaders();
 
-      // Prevent idle connection dropouts
       const heartbeat = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -148,7 +139,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             console.error(`🚨 OpenRouter Error [Status ${status}]:`, detailedErrorMsg);
 
-            // Halt immediately on hard client errors
             if (status === 400 || status === 401 || status === 404) {
               throw new Error(`[HTTP ${status}] ${detailedErrorMsg}`);
             }
@@ -166,8 +156,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         clearInterval(heartbeat);
 
         let buffer = '';
-        let reasoningStarted = false;
-        let hasEmittedContent = false;
 
         response.data.on('data', (chunk) => {
           buffer += chunk.toString();
@@ -182,10 +170,6 @@ app.post('/v1/chat/completions', async (req, res) => {
               const payload = trimmed.slice(6);
 
               if (payload === '[DONE]') {
-                if (reasoningStarted) {
-                  res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '\n</think>\n\n' } }] })}\n\n`);
-                  reasoningStarted = false;
-                }
                 res.write('data: [DONE]\n\n');
                 continue;
               }
@@ -195,59 +179,32 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                 if (data.choices?.[0]?.delta) {
                   const delta = data.choices[0].delta;
-                  const reasoning = delta.reasoning_content || delta.reasoning;
-                  const content = delta.content;
 
-                  let combinedContent = '';
+                  // Strip any reasoning fields if provider sends them
+                  delete delta.reasoning_content;
+                  delete delta.reasoning;
+                  delete delta.reasoning_details;
 
-                  if (SHOW_REASONING && reasoning) {
-                    if (!reasoningStarted) {
-                      combinedContent += '<think>\n';
-                      reasoningStarted = true;
-                    }
-                    combinedContent += reasoning;
-                  }
-
-                  if (content !== undefined && content !== null) {
-                    if (reasoningStarted && content !== '') {
-                      combinedContent += '\n</think>\n\n';
-                      reasoningStarted = false;
-                    }
-                    combinedContent += content;
-                  }
-
-                  if (combinedContent !== '') {
-                    hasEmittedContent = true;
-                    delta.content = combinedContent;
-                    delete delta.reasoning_content;
-                    delete delta.reasoning;
+                  // Pass through text directly
+                  if (delta.content !== undefined && delta.content !== null) {
                     res.write(`data: ${JSON.stringify(data)}\n\n`);
                   }
                 } else {
                   res.write(`data: ${JSON.stringify(data)}\n\n`);
                 }
               } catch (e) {
-                // Ignore incomplete line chunks
+                // Incomplete line chunk
               }
             }
           }
         });
 
-        response.data.on('end', () => {
-          if (reasoningStarted) {
-            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '\n</think>\n\n' } }] })}\n\n`);
-          }
-          if (!hasEmittedContent) {
-            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '\n\n*(Model reached token budget before drafting narrative. Increase Max New Tokens in settings.)*' } }] })}\n\n`);
-          }
-          res.end();
-        });
+        response.data.on('end', () => res.end());
 
       } catch (streamError) {
         clearInterval(heartbeat);
         console.error('🚨 Stream Error:', streamError.message);
         
-        // Write the actual error into the chat UI rather than triggering pgshag2
         res.write(`data: ${JSON.stringify({
           choices: [{ delta: { content: `\n\n**[Proxy Error]**: ${streamError.message}` } }]
         })}\n\n`);
