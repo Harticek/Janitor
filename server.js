@@ -15,8 +15,11 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const OPENROUTER_API_BASE = process.env.OPENROUTER_API_BASE || 'https://openrouter.ai/api/v1';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.NIM_API_KEY;
 
+// Show <think> blocks in Janitor only when the model actually returns reasoning
 const SHOW_REASONING = true;
+// Enable thinking on capable models. Ignored for models without reasoning support.
 const ENABLE_THINKING_MODE = true;
+const DEFAULT_REASONING_EFFORT = 'low';
 
 const axiosInstance = axios.create({
   httpAgent: new http.Agent({ keepAlive: true }),
@@ -30,7 +33,108 @@ const MODEL_MAPPING = {
   'qwen-72b': 'qwen/qwen-2.5-72b-instruct:floor'
 };
 
+// Janitor / OpenAI generation fields to forward unchanged when present
+const PASSTHROUGH_KEYS = [
+  'temperature',
+  'max_tokens',
+  'max_completion_tokens',
+  'top_p',
+  'top_k',
+  'min_p',
+  'top_a',
+  'presence_penalty',
+  'frequency_penalty',
+  'repetition_penalty',
+  'stop',
+  'seed',
+  'n',
+  'logit_bias'
+];
+
+// Fallback if OpenRouter model catalog has not loaded yet
+const REASONING_MODEL_PATTERNS = [
+  /deepseek-r1/i,
+  /deepseek-reasoner/i,
+  /deepseek-v3\.[12]/i,
+  /deepseek-v4/i,
+  /deepseek-flash/i,
+  /\br1\b/i,
+  /\bo1\b/i,
+  /\bo3\b/i,
+  /\bo4\b/i,
+  /gpt-5/i,
+  /gemini-2\.5/i,
+  /gemini-3/i,
+  /thinking/i,
+  /reasoner/i,
+  /qwen3/i,
+  /qwq/i,
+  /grok-3/i,
+  /grok-4/i
+];
+
+const NON_REASONING_MODEL_PATTERNS = [
+  /^deepseek\/deepseek-chat(?!-v3\.[12])(?!-v4)/i,
+  /qwen-2\.5-72b-instruct/i,
+  /qwen\/qwen-2\.5-72b-instruct/i
+];
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+let modelReasoningCache = new Map();
+let modelCacheLoadedAt = 0;
+const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
+
+function stripProviderSuffix(modelId = '') {
+  return String(modelId).split(':')[0];
+}
+
+async function refreshModelReasoningCache() {
+  try {
+    const response = await axiosInstance.get(`${OPENROUTER_API_BASE}/models`, {
+      timeout: 20000
+    });
+    const next = new Map();
+    for (const model of response.data?.data || []) {
+      const params = model.supported_parameters || [];
+      const supports = !!(
+        model.reasoning ||
+        params.includes('reasoning') ||
+        params.includes('reasoning_effort') ||
+        params.includes('include_reasoning')
+      );
+      next.set(model.id, supports);
+      next.set(stripProviderSuffix(model.id), supports);
+    }
+    modelReasoningCache = next;
+    modelCacheLoadedAt = Date.now();
+    console.log(`Loaded reasoning caps for ${next.size} model ids`);
+  } catch (err) {
+    console.error('Failed to refresh OpenRouter model catalog:', err.message);
+  }
+}
+
+function fallbackSupportsReasoning(modelId) {
+  const id = stripProviderSuffix(modelId);
+  if (NON_REASONING_MODEL_PATTERNS.some((re) => re.test(id))) return false;
+  return REASONING_MODEL_PATTERNS.some((re) => re.test(id));
+}
+
+function modelSupportsReasoning(modelId) {
+  const id = stripProviderSuffix(modelId);
+  if (modelReasoningCache.has(modelId)) return modelReasoningCache.get(modelId);
+  if (modelReasoningCache.has(id)) return modelReasoningCache.get(id);
+  return fallbackSupportsReasoning(id);
+}
+
+function copyDefined(target, source, keys) {
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
 
 async function parseAxiosStreamError(error) {
   if (error.response?.data && typeof error.response.data.on === 'function') {
@@ -54,7 +158,12 @@ async function parseAxiosStreamError(error) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'OpenRouter Proxy Active' });
+  res.json({
+    status: 'ok',
+    service: 'OpenRouter Proxy Active',
+    thinkingDefault: ENABLE_THINKING_MODE,
+    modelCacheSize: modelReasoningCache.size
+  });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -71,9 +180,13 @@ app.get('/v1/models', (req, res) => {
 
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    let { model, messages, temperature, max_tokens, stream } = req.body;
+    if (!modelCacheLoadedAt || Date.now() - modelCacheLoadedAt > MODEL_CACHE_TTL_MS) {
+      refreshModelReasoningCache();
+    }
 
-    // Strip previous thought tags to prevent context bloating
+    const body = req.body || {};
+    let { model, messages, stream } = body;
+
     let cleanedMessages = (messages || []).map(msg => {
       let content = msg.content;
       if (msg.role === 'assistant' && typeof content === 'string') {
@@ -86,28 +199,32 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
     const targetModel = MODEL_MAPPING[model] || model || 'deepseek/deepseek-v4-flash-0731:floor';
-
-    // Ensure adequate token headroom so reasoning doesn't consume entire budget
-    const safeMaxTokens = Math.max(max_tokens || 2048, 2048);
+    const reasoningCapable = modelSupportsReasoning(targetModel);
+    const useReasoning = ENABLE_THINKING_MODE && reasoningCapable;
 
     const openrouterRequest = {
       model: targetModel,
       messages: cleanedMessages,
-      temperature: temperature !== undefined ? temperature : 0.7,
-      max_tokens: safeMaxTokens,
-      stream: stream || false,
+      stream: !!stream,
       provider: {
         sort: 'price',
         allow_fallbacks: true
       }
     };
 
-    // Use only 'effort' to prevent OpenRouter 400 parameter conflict
-    if (ENABLE_THINKING_MODE) {
+    copyDefined(openrouterRequest, body, PASSTHROUGH_KEYS);
+
+    // Only attach reasoning for models that support it.
+    // Non-reasoning models (deepseek-chat, qwen-2.5-72b, etc.) get no reasoning field.
+    if (useReasoning) {
       openrouterRequest.reasoning = {
-        effort: 'low'
+        effort: body.reasoning?.effort || body.reasoning_effort || DEFAULT_REASONING_EFFORT
       };
     }
+
+    console.log(
+      `→ \( {targetModel} | reasoning= \){useReasoning} | max_tokens=${openrouterRequest.max_tokens ?? 'unset'}`
+    );
 
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -115,7 +232,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Connection', 'keep-alive');
       if (res.flushHeaders) res.flushHeaders();
 
-      // Prevent idle connection dropouts
       const heartbeat = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -148,7 +264,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             console.error(`🚨 OpenRouter Error [Status ${status}]:`, detailedErrorMsg);
 
-            // Halt immediately on hard client errors
             if (status === 400 || status === 401 || status === 404) {
               throw new Error(`[HTTP ${status}] ${detailedErrorMsg}`);
             }
@@ -195,7 +310,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
                 if (data.choices?.[0]?.delta) {
                   const delta = data.choices[0].delta;
-                  const reasoning = delta.reasoning_content || delta.reasoning;
+                  const reasoning = useReasoning ? (delta.reasoning_content || delta.reasoning) : null;
                   const content = delta.content;
 
                   let combinedContent = '';
@@ -246,8 +361,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       } catch (streamError) {
         clearInterval(heartbeat);
         console.error('🚨 Stream Error:', streamError.message);
-        
-        // Write the actual error into the chat UI rather than triggering pgshag2
+
         res.write(`data: ${JSON.stringify({
           choices: [{ delta: { content: `\n\n**[Proxy Error]**: ${streamError.message}` } }]
         })}\n\n`);
@@ -279,4 +393,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 });
 
 app.all('*', (req, res) => res.status(404).json({ error: { message: 'Not found' } }));
-app.listen(PORT, () => console.log(`🚀 Proxy active on port ${PORT}`));
+
+app.listen(PORT, () => {
+  console.log(`🚀 Proxy active on port ${PORT}`);
+  refreshModelReasoningCache();
+});
